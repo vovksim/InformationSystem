@@ -1,16 +1,38 @@
+version: "3.8"
+
 services:
-  # --- MAIN DATABASE (choose one) ---
+
   mongo:
     image: mongo:7
     container_name: mongo
+    restart: always
     ports:
       - "27017:27017"
-    volumes:
-      - ../data/mongo_db:/data/db
+    command: ["--bind_ip_all"]  # disables auth and allows external connections
     networks:
       - infosys-net
+    volumes:
+      - ../data/mongo_db:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval \"db.adminCommand({ ping: 1 })\" >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  # --- AUTH SERVICE (Python + SQLite) ---
+  mongodb-exporter:
+    image: percona/mongodb_exporter:0.40.0
+    container_name: mongodb-exporter
+    restart: always
+    ports:
+      - "9216:9216"
+    depends_on:
+      - mongo
+    networks:
+      - infosys-net
+    command:
+      - "--mongodb.uri=mongodb://mongo:27017"
+      - "--collect-all"  # enables all collectors available for this connection
+
   auth-service:
     build:
       context: ../src/auth_service
@@ -21,14 +43,12 @@ services:
     environment:
       - DB_PATH=/app/data/auth.db
     ports:
-      - "5000:5000"        # Flask port
+      - "5000:5000"
     depends_on:
-      - mongo
       - redis
     networks:
       - infosys-net
 
-  # --- PROMETHEUS ---
   prometheus:
     image: prom/prometheus:latest
     container_name: prometheus
@@ -41,7 +61,6 @@ services:
     depends_on:
       - redis_exporter
 
-  # --- GRAFANA ---
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
@@ -53,24 +72,13 @@ services:
       - prometheus
     networks:
       - infosys-net
-  
-  # --- STRESSER ---
-  # stresser:
-  #   build:
-  #     context: ../src/db_stresser       
-  #   container_name: db_stresser
-  #   depends_on:
-  #     - mongo
-  #   volumes:
-  #     - ../src/db_stresser/config.yml:/app/config.yml:ro
-  #   networks:
-  #     - infosys-net
-  
+
   crm-service:
     build:
       context: ../src/crm_service
       dockerfile: Dockerfile
     container_name: crm_service
+    restart: always
     ports:
       - "5001:5001"
     networks:
@@ -78,11 +86,13 @@ services:
     depends_on:
       - auth-service
       - mongo
+    environment:
+      - MONGO_URI=mongodb://mongo:27017/crm_db 
 
   redis:
     image: redis:7
     container_name: redis
-    ports: 
+    ports:
       - "6379:6379"
     networks:
       - infosys-net
@@ -97,7 +107,6 @@ services:
       - redis
     networks:
       - infosys-net
-      
 
 volumes:
   grafana_data:
