@@ -3,4 +3,4 @@ PyJWT
 werkzeug
 prometheus_client
 redis
-debugpy
+prometheus-client

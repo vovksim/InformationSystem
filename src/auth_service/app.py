@@ -1,16 +1,11 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, Response, make_response
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, Response, make_response, g
 import sqlite3, os, uuid
-from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 import redis
 import json
-
-import debugpy
-import os
-
-if os.getenv("FLASK_DEBUG", "0") == "1":
-    debugpy.listen(("0.0.0.0", 5678))
-    print("Waiting for VS Code debugger to attach...")
-    debugpy.wait_for_client()
+import time
+import threading
+import logging
 
 app = Flask(__name__)
 app.secret_key = "supersecret"
@@ -19,23 +14,111 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "auth.db")
 # Connect to Redis (hostname = redis container name)
 redis_client = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-REQUEST_COUNT = Counter('auth_requests_total', 'Total number of requests', ['method', 'endpoint'])
+# --- Configuration ---
+SESSION_TTL = 30  # seconds (adjust to 3600 for 1 hour)
+SESSION_TTL_GAUGE_VALUE = SESSION_TTL
+ACTIVE_SESSIONS_POLL_INTERVAL = 10  # seconds
 
-SESSION_TTL = 30  # 1 hour session expiry in Redis
+# --- Logging ---
+logging.basicConfig(
+    level=logging.INFO,  # Change to DEBUG for more verbose logs
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
 
-@app.route("/")
-def index():
-    return redirect(url_for("login"))
+# --- Prometheus metrics ---
+REQUEST_COUNT = Counter(
+    'auth_requests_total',
+    'Total number of requests',
+    ['method', 'endpoint']
+)
 
-@app.before_request
-def before_request_func():
-    if request.path != '/metrics':
-        REQUEST_COUNT.labels(method=request.method, endpoint=request.path).inc()
+REQUEST_LATENCY = Histogram(
+    'auth_request_latency_seconds',
+    'Request latency in seconds',
+    ['method', 'endpoint']
+)
 
-@app.route('/metrics')
-def metrics():
-    return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+LOGIN_SUCCESS = Counter(
+    'auth_login_success_total',
+    'Total successful logins'
+)
 
+LOGIN_FAILED = Counter(
+    'auth_login_failed_total',
+    'Total failed login attempts'
+)
+
+VALIDATE_SUCCESS = Counter(
+    'auth_validate_success_total',
+    'Total successful token validations'
+)
+
+VALIDATE_FAILED = Counter(
+    'auth_validate_failed_total',
+    'Total failed token validations'
+)
+
+TOKEN_VALIDATION_LATENCY = Histogram(
+    'auth_token_validation_latency_seconds',
+    'Latency of token validation'
+)
+
+REDIS_LATENCY = Histogram(
+    'auth_redis_latency_seconds',
+    'Time spent performing Redis operations',
+    ['operation']
+)
+
+REDIS_ERRORS = Counter(
+    'auth_redis_errors_total',
+    'Count of Redis-related errors',
+    ['operation']
+)
+
+ACTIVE_SESSIONS = Gauge(
+    'auth_active_sessions',
+    'Number of active sessions stored in Redis'
+)
+
+SESSION_TTL_GAUGE = Gauge(
+    'auth_session_ttl_seconds',
+    'Configured TTL for sessions in seconds'
+)
+SESSION_TTL_GAUGE.set(SESSION_TTL_GAUGE_VALUE)
+
+# --- Helpers ---
+def count_active_sessions():
+    """
+    Count session:* keys using SCAN (non-blocking) and set ACTIVE_SESSIONS gauge.
+    """
+    try:
+        count = 0
+        for _ in redis_client.scan_iter(match="session:*"):
+            count += 1
+        ACTIVE_SESSIONS.set(count)
+        logger.debug("Active sessions counted: %d", count)
+    except Exception as e:
+        REDIS_ERRORS.labels(operation="scan_sessions").inc()
+        logger.error("Error counting sessions in Redis: %s", e)
+
+def active_sessions_loop(stop_event: threading.Event):
+    """
+    Background loop that periodically updates ACTIVE_SESSIONS gauge.
+    Runs until stop_event is set.
+    """
+    logger.info("Starting active sessions monitor thread (interval %ss)", ACTIVE_SESSIONS_POLL_INTERVAL)
+    while not stop_event.is_set():
+        count_active_sessions()
+        # wait with early exit
+        stop_event.wait(ACTIVE_SESSIONS_POLL_INTERVAL)
+    logger.info("Active sessions monitor thread stopping")
+
+# Only start background thread when running as main (avoid duplication in reloader)
+_active_sessions_stop_event = None
+_active_sessions_thread = None
+
+# --- DB Init ---
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
@@ -48,14 +131,35 @@ def init_db():
         """)
         conn.commit()
 
-import logging
+# --- Request timing hooks ---
+@app.before_request
+def before_request_func():
+    # record start time for latency measurement
+    g._start_time = time.monotonic()
+    # increment request counter (skip metrics endpoint)
+    if request.path != '/metrics':
+        REQUEST_COUNT.labels(method=request.method, endpoint=request.path).inc()
 
-# Ensure you have this at the top of your file
-logging.basicConfig(
-    level=logging.INFO,  # Use DEBUG for more verbose output
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-logger = logging.getLogger(__name__)
+@app.after_request
+def after_request_func(response):
+    # observe latency for requests (skip metrics to avoid recursion)
+    try:
+        if hasattr(g, "_start_time") and request.path != '/metrics':
+            elapsed = time.monotonic() - g._start_time
+            REQUEST_LATENCY.labels(method=request.method, endpoint=request.path).observe(elapsed)
+    except Exception as e:
+        logger.debug("Error recording request latency: %s", e)
+    return response
+
+# --- Metrics endpoint ---
+@app.route('/metrics')
+def metrics():
+    return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
+
+# --- Application routes ---
+@app.route("/")
+def index():
+    return redirect(url_for("login"))
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -72,21 +176,36 @@ def login():
                 user = cur.fetchone()
 
             if user:
+                LOGIN_SUCCESS.inc()
                 token = str(uuid.uuid4())
-                session_data = {"name": username, "role": user[3]}
+                session_data = {"name": username, "role": user[3] if len(user) > 3 else "user"}
                 logger.info("User %s authenticated successfully. Session token: %s", username, token)
 
-                # Store session in Redis
-                redis_client.setex(f"session:{token}", SESSION_TTL, json.dumps(session_data))
-                logger.debug("Session stored in Redis for token: %s", token)
+                # Store session in Redis and measure latency
+                try:
+                    start = time.monotonic()
+                    redis_client.setex(f"session:{token}", SESSION_TTL, json.dumps(session_data))
+                    REDIS_LATENCY.labels(operation="set_session").observe(time.monotonic() - start)
+                except Exception as e:
+                    REDIS_ERRORS.labels(operation="set_session").inc()
+                    logger.error("Redis error during session set: %s", e)
+                    flash("Internal error (Redis). Please try again.")
+                    return render_template("login.html")
+
+                # Update active sessions gauge (best-effort; background thread will also update periodically)
+                try:
+                    count_active_sessions()
+                except Exception:
+                    # already handled inside function
+                    pass
 
                 # Create response with cookie
                 resp = make_response(redirect("http://localhost:5001/dashboard"))
                 resp.set_cookie("auth_token", token, max_age=SESSION_TTL, httponly=True)
                 logger.info("Set session cookie for user: %s", username)
-
                 return resp
             else:
+                LOGIN_FAILED.inc()
                 logger.warning("Invalid login attempt for user: %s", username)
                 flash("Invalid credentials")
         except Exception as e:
@@ -111,22 +230,53 @@ def register():
             flash("Username already exists.")
     return render_template("register.html")
 
+
 @app.route("/api/validate")
 def validate():
-    token = request.cookies.get("session_id")
+    # Support token passed either as query param (server-to-server) or cookie (browser)
+    token = request.args.get("token") or request.cookies.get("session_id") or request.cookies.get("auth_token")
+    logger.info("Token validation attempt. token=%s", token)
 
     if not token:
+        VALIDATE_FAILED.inc()
+        logger.warning("Validation failed: no token provided")
         return jsonify({"status": "error"}), 403
 
-    session_raw = redis_client.get(f"session:{token}")
+    with TOKEN_VALIDATION_LATENCY.time():
+        try:
+            start = time.monotonic()
+            session_raw = redis_client.get(f"session:{token}")
+            REDIS_LATENCY.labels(operation="get_session").observe(time.monotonic() - start)
+        except Exception as e:
+            REDIS_ERRORS.labels(operation="get_session").inc()
+            logger.error("Redis error during token validation: %s", str(e))
+            return jsonify({"status": "error"}), 500
 
     if not session_raw:
+        VALIDATE_FAILED.inc()
+        logger.warning("Validation failed: token not found or expired: %s", token)
         return jsonify({"status": "error"}), 403
 
+    VALIDATE_SUCCESS.inc()
     session_data = json.loads(session_raw)
-
     return jsonify({"status": "ok", **session_data})
 
+
 if __name__ == "__main__":
+    # initialize DB
     init_db()
-    app.run(host="0.0.0.0", port=5000, debug=False)  # Important!
+
+    # start background active-sessions monitor thread
+    _active_sessions_stop_event = threading.Event()
+    _active_sessions_thread = threading.Thread(target=active_sessions_loop, args=(_active_sessions_stop_event,), daemon=True)
+    _active_sessions_thread.start()
+
+    try:
+        # Run Flask (debug=False as you already had it)
+        app.run(host="0.0.0.0", port=5000, debug=False)
+    finally:
+        # signal background thread to stop when app exits
+        if _active_sessions_stop_event:
+            _active_sessions_stop_event.set()
+            if _active_sessions_thread:
+                _active_sessions_thread.join(timeout=1)
