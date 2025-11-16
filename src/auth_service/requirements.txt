@@ -2,3 +2,5 @@ Flask>=2.0
 PyJWT
 werkzeug
 prometheus_client
+redis
+debugpy

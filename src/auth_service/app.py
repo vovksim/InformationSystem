@@ -1,19 +1,34 @@
-from flask import Flask, render_template, request, redirect, session, url_for, flash, jsonify
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, Response, make_response
 import sqlite3, os, uuid
 from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
-from flask import Response
+import redis
+import json
+
+import debugpy
+import os
+
+if os.getenv("FLASK_DEBUG", "0") == "1":
+    debugpy.listen(("0.0.0.0", 5678))
+    print("Waiting for VS Code debugger to attach...")
+    debugpy.wait_for_client()
 
 app = Flask(__name__)
 app.secret_key = "supersecret"
 DB_PATH = os.path.join(os.path.dirname(__file__), "auth.db")
 
-sessions = {}  # in-memory session tokens for CRM access
+# Connect to Redis (hostname = redis container name)
+redis_client = redis.Redis(host="redis", port=6379, decode_responses=True)
 
 REQUEST_COUNT = Counter('auth_requests_total', 'Total number of requests', ['method', 'endpoint'])
 
+SESSION_TTL = 30  # 1 hour session expiry in Redis
+
+@app.route("/")
+def index():
+    return redirect(url_for("login"))
+
 @app.before_request
 def before_request_func():
-    # Skip counting Prometheus scrapes
     if request.path != '/metrics':
         REQUEST_COUNT.labels(method=request.method, endpoint=request.path).inc()
 
@@ -33,23 +48,53 @@ def init_db():
         """)
         conn.commit()
 
+import logging
+
+# Ensure you have this at the top of your file
+logging.basicConfig(
+    level=logging.INFO,  # Use DEBUG for more verbose output
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger(__name__)
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        username = request.form["username"]
-        password = request.form["password"]
+        username = request.form.get("username")
+        password = request.form.get("password")
+        logger.info("Login attempt for user: %s", username)
 
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.execute("SELECT * FROM users WHERE username=? AND password=?", (username, password))
-            user = cur.fetchone()
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cur = conn.execute(
+                    "SELECT * FROM users WHERE username=? AND password=?", (username, password)
+                )
+                user = cur.fetchone()
 
-        if user:
-            token = str(uuid.uuid4())
-            sessions[token] = {"name": username, "role": user[3]}
-            return redirect(f"http://localhost:5001/dashboard?token={token}")
-        else:
-            flash("Invalid credentials")
+            if user:
+                token = str(uuid.uuid4())
+                session_data = {"name": username, "role": user[3]}
+                logger.info("User %s authenticated successfully. Session token: %s", username, token)
+
+                # Store session in Redis
+                redis_client.setex(f"session:{token}", SESSION_TTL, json.dumps(session_data))
+                logger.debug("Session stored in Redis for token: %s", token)
+
+                # Create response with cookie
+                resp = make_response(redirect("http://localhost:5001/dashboard"))
+                resp.set_cookie("auth_token", token, max_age=SESSION_TTL, httponly=True)
+                logger.info("Set session cookie for user: %s", username)
+
+                return resp
+            else:
+                logger.warning("Invalid login attempt for user: %s", username)
+                flash("Invalid credentials")
+        except Exception as e:
+            logger.error("Error during login for user %s: %s", username, str(e))
+            flash("Internal error, please try again.")
+
     return render_template("login.html")
+
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
@@ -68,11 +113,20 @@ def register():
 
 @app.route("/api/validate")
 def validate():
-    token = request.args.get("token")
-    if token in sessions:
-        return jsonify({"status": "ok", **sessions[token]})
-    return jsonify({"status": "error"}), 403
+    token = request.cookies.get("session_id")
+
+    if not token:
+        return jsonify({"status": "error"}), 403
+
+    session_raw = redis_client.get(f"session:{token}")
+
+    if not session_raw:
+        return jsonify({"status": "error"}), 403
+
+    session_data = json.loads(session_raw)
+
+    return jsonify({"status": "ok", **session_data})
 
 if __name__ == "__main__":
     init_db()
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5000, debug=False)  # Important!
