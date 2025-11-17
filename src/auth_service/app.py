@@ -9,24 +9,23 @@ import logging
 
 app = Flask(__name__)
 app.secret_key = "supersecret"
-DB_PATH = os.path.join(os.path.dirname(__file__), "auth.db")
 
-# Connect to Redis (hostname = redis container name)
+DB_PATH = os.getenv("DB_PATH", "/app/data/auth.db")  # fallback if env not set
+db_dir = os.path.dirname(DB_PATH)
+os.makedirs(db_dir, exist_ok=True)
+
 redis_client = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-# --- Configuration ---
 SESSION_TTL = 30  # seconds (adjust to 3600 for 1 hour)
 SESSION_TTL_GAUGE_VALUE = SESSION_TTL
 ACTIVE_SESSIONS_POLL_INTERVAL = 10  # seconds
 
-# --- Logging ---
 logging.basicConfig(
     level=logging.INFO,  # Change to DEBUG for more verbose logs
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# --- Prometheus metrics ---
 REQUEST_COUNT = Counter(
     'auth_requests_total',
     'Total number of requests',
@@ -114,11 +113,9 @@ def active_sessions_loop(stop_event: threading.Event):
         stop_event.wait(ACTIVE_SESSIONS_POLL_INTERVAL)
     logger.info("Active sessions monitor thread stopping")
 
-# Only start background thread when running as main (avoid duplication in reloader)
 _active_sessions_stop_event = None
 _active_sessions_thread = None
 
-# --- DB Init ---
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
@@ -131,18 +128,14 @@ def init_db():
         """)
         conn.commit()
 
-# --- Request timing hooks ---
 @app.before_request
 def before_request_func():
-    # record start time for latency measurement
     g._start_time = time.monotonic()
-    # increment request counter (skip metrics endpoint)
     if request.path != '/metrics':
         REQUEST_COUNT.labels(method=request.method, endpoint=request.path).inc()
 
 @app.after_request
 def after_request_func(response):
-    # observe latency for requests (skip metrics to avoid recursion)
     try:
         if hasattr(g, "_start_time") and request.path != '/metrics':
             elapsed = time.monotonic() - g._start_time
@@ -151,12 +144,10 @@ def after_request_func(response):
         logger.debug("Error recording request latency: %s", e)
     return response
 
-# --- Metrics endpoint ---
 @app.route('/metrics')
 def metrics():
     return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
 
-# --- Application routes ---
 @app.route("/")
 def index():
     return redirect(url_for("login"))
@@ -180,8 +171,6 @@ def login():
                 token = str(uuid.uuid4())
                 session_data = {"name": username, "role": user[3] if len(user) > 3 else "user"}
                 logger.info("User %s authenticated successfully. Session token: %s", username, token)
-
-                # Store session in Redis and measure latency
                 try:
                     start = time.monotonic()
                     redis_client.setex(f"session:{token}", SESSION_TTL, json.dumps(session_data))
@@ -191,15 +180,10 @@ def login():
                     logger.error("Redis error during session set: %s", e)
                     flash("Internal error (Redis). Please try again.")
                     return render_template("login.html")
-
-                # Update active sessions gauge (best-effort; background thread will also update periodically)
                 try:
                     count_active_sessions()
                 except Exception:
-                    # already handled inside function
                     pass
-
-                # Create response with cookie
                 resp = make_response(redirect("http://localhost:5001/dashboard"))
                 resp.set_cookie("auth_token", token, max_age=SESSION_TTL, httponly=True)
                 logger.info("Set session cookie for user: %s", username)
@@ -233,7 +217,6 @@ def register():
 
 @app.route("/api/validate")
 def validate():
-    # Support token passed either as query param (server-to-server) or cookie (browser)
     token = request.args.get("token") or request.cookies.get("session_id") or request.cookies.get("auth_token")
     logger.info("Token validation attempt. token=%s", token)
 
@@ -263,19 +246,15 @@ def validate():
 
 
 if __name__ == "__main__":
-    # initialize DB
+    logger.info(DB_PATH)
     init_db()
-
-    # start background active-sessions monitor thread
     _active_sessions_stop_event = threading.Event()
     _active_sessions_thread = threading.Thread(target=active_sessions_loop, args=(_active_sessions_stop_event,), daemon=True)
     _active_sessions_thread.start()
 
     try:
-        # Run Flask (debug=False as you already had it)
         app.run(host="0.0.0.0", port=5000, debug=False)
     finally:
-        # signal background thread to stop when app exits
         if _active_sessions_stop_event:
             _active_sessions_stop_event.set()
             if _active_sessions_thread:

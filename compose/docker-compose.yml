@@ -38,10 +38,7 @@ services:
       context: ../src/auth_service
     container_name: auth_service
     volumes:
-      - ../src/auth_service:/app
       - ../data/sqlite:/app/data
-    environment:
-      - DB_PATH=/app/data/auth.db
     ports:
       - "5000:5000"
     depends_on:
