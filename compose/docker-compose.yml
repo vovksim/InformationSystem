@@ -8,7 +8,7 @@ services:
     restart: always
     ports:
       - "27017:27017"
-    command: ["--bind_ip_all"]  # disables auth and allows external connections
+    command: ["--bind_ip_all"]  
     networks:
       - infosys-net
     volumes:
@@ -31,7 +31,7 @@ services:
       - infosys-net
     command:
       - "--mongodb.uri=mongodb://mongo:27017"
-      - "--collect-all"  # enables all collectors available for this connection
+      - "--collect-all" 
 
   auth-service:
     build:
