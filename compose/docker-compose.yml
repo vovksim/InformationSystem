@@ -65,6 +65,8 @@ services:
       - "3000:3000"
     volumes:
       - grafana_data:/var/lib/grafana
+      - ./configs/grafana/dashboards:/var/lib/grafana/dashboards  # mount dashboards
+      - ./configs/grafana/provisioning:/etc/grafana/provisioning  # mount provisioning
     depends_on:
       - prometheus
     networks:
